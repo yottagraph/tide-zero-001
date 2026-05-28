@@ -1,0 +1,37 @@
+# Broadchurch project configuration
+# Auto-generated during tenant provisioning.
+
+gcp:
+  project: broadchurch
+  region: us-central1
+  staging_bucket: broadchurch-agent-staging
+  github_deploy_sa: github-deploy@broadchurch.iam.gserviceaccount.com
+
+tenant:
+  project_name: "tide-zero-001"
+  display_name: "Tide Zero #001 — Fresh-tenant compute-job e2e"
+  org_id: "org_HVl7EFxjJoEw8PSC"
+  service_account: "tenant-hvl7efxjjoew8psc@broadchurch.iam.gserviceaccount.com"
+
+gateway:
+  url: "https://broadchurch-portal-194773164895.us-central1.run.app"
+  qs_api_key: "3c4ec5313505824ce7625a2f2d6aa5075a551e7793eacc0731f60c3bf3dc68a0"
+
+query_server:
+  url: "https://query.pip.prod.g.lovelace.ai"
+  audience: ""
+
+auth:
+  client_id: "jbjhW2vTv6fZbccNqMhm4tkIwSiL1ISG"
+  audience: ""
+
+aether:
+  data_mode: "api-mcp"
+
+agents: {}
+
+# Compute jobs (Cloud Run Jobs) registered with the Portal.
+jobs: {}
+
+# Cloud Workflows registered with the Portal.
+workflows: {}
