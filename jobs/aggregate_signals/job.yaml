@@ -1,0 +1,25 @@
+# Compute job manifest for `aggregate_signals` — the Tide Telemetry
+# proof-of-substrate job. Synthesises ~1000 maritime activity events,
+# aggregates them by category, and writes the per-category summary rows
+# into the per-tenant Cloud SQL Postgres (`tide_aggregates` table).
+#
+# Schema/runtime reference: `.agents/skills/aether/compute.md`.
+# Validate locally with:
+#     python3 scripts/validate-job-manifest.py jobs/aggregate_signals/job.yaml
+#
+# Platform-injected env (set automatically by the deploy workflow when
+# Cloud SQL is enabled on this tenant): `INSTANCE_CONNECTION_NAME`,
+# `DB_USER`, `DB_NAME`, `ORG_ID`, `GOOGLE_CLOUD_PROJECT`.
+
+name: aggregate-signals
+cpu: "1"
+memory: "1Gi"
+max_retries: 1
+task_timeout: "10m"
+parallelism: 1
+task_count: 1
+
+env:
+  # Total number of synthesised events per run. Kept small — the goal
+  # is to prove the substrate works, not to stress it.
+  TIDE_EVENT_COUNT: "1000"

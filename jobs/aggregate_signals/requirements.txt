@@ -1,0 +1,8 @@
+pyyaml>=6.0
+
+# Cloud SQL via the IAM-auth Python Connector. The platform-injected
+# INSTANCE_CONNECTION_NAME / DB_USER / DB_NAME env vars + Workload
+# Identity binding to bc-tenant-jobs handle the auth handshake; no
+# password is needed.
+cloud-sql-python-connector[pg8000]>=1.10
+pg8000>=1.30
