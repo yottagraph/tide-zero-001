@@ -133,14 +133,14 @@ Do all four of these and report back; that's the end of the project:
   Vercel app uses the `getDb()` helper in `server/utils/neon.ts`
   (IAM auth on the runtime SA — see `skills/aether/storage.md`).
   The compute job connects with `google-cloud-sql-python-connector`
-  + IAM auth using the `bc-tenant-jobs` GSA via Workload Identity,
-  with `INSTANCE_CONNECTION_NAME`, `DB_USER`, and `DB_NAME` injected
-  by the deploy workflow. Both routes write to the same physical
-  Postgres. See `compute.md`'s _Quick start: a Cloud SQL aggregation
-  job_ for the canonical pattern — it's copy-pasteable for this
-  project's job almost as-is. If those env vars are missing at job
-  runtime, log a clear error and report it (that's a platform
-  finding worth surfacing).
+    - IAM auth using the `bc-tenant-jobs` GSA via Workload Identity,
+      with `INSTANCE_CONNECTION_NAME`, `DB_USER`, and `DB_NAME` injected
+      by the deploy workflow. Both routes write to the same physical
+      Postgres. See `compute.md`'s _Quick start: a Cloud SQL aggregation
+      job_ for the canonical pattern — it's copy-pasteable for this
+      project's job almost as-is. If those env vars are missing at job
+      runtime, log a clear error and report it (that's a platform
+      finding worth surfacing).
 - **Cloud SQL warm-up takes 5-15 min.** The tenant is provisioned
   with `cloud_sql: true`, so the async worker is queued. Before you
   can deploy the job, the warm-up has to finish — watch the Portal
@@ -182,11 +182,10 @@ When you're done — or stuck — report on:
 That feedback is the actual product of this project; the running
 job is just the evidence the substrate works.
 
-
 ## Status
 
 Project just created. Run `/build_my_app` in Cursor to start building.
 
 ## Modules
 
-*None yet — the agent will populate this as features are built.*
+_None yet — the agent will populate this as features are built._
