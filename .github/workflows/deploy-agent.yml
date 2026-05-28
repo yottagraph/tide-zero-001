@@ -1,0 +1,185 @@
+name: Deploy Agent
+on:
+    workflow_dispatch:
+        inputs:
+            agent_name:
+                description: "Agent directory name under agents/ (e.g. example_agent)"
+                required: true
+
+permissions:
+    contents: read
+    id-token: write
+
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Read config from broadchurch.yaml
+              id: config
+              run: |
+                  PROJECT=$(yq -r '.gcp.project' broadchurch.yaml)
+                  echo "project=${PROJECT}" >> "$GITHUB_OUTPUT"
+                  echo "region=$(yq -r '.gcp.region' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "project_name=$(yq -r '.tenant.project_name' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "org_id=$(yq -r '.tenant.org_id' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "service_account=$(yq -r '.tenant.service_account' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "gateway_url=$(yq -r '.gateway.url' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  # Per ADR-015: per-tenant projects use a per-project github-deploy
+                  # SA. Fall back to the central one for legacy / shared-mode tenants.
+                  GH_DEPLOY_SA=$(yq -r '.gcp.github_deploy_sa // ""' broadchurch.yaml)
+                  if [ -z "${GH_DEPLOY_SA}" ] || [ "${GH_DEPLOY_SA}" = "null" ]; then
+                    GH_DEPLOY_SA="github-deploy@${PROJECT}.iam.gserviceaccount.com"
+                  fi
+                  echo "github_deploy_sa=${GH_DEPLOY_SA}" >> "$GITHUB_OUTPUT"
+
+            - name: Validate agent directory
+              run: |
+                  AGENT_DIR="agents/${{ inputs.agent_name }}"
+                  if [ ! -f "${AGENT_DIR}/agent.py" ]; then
+                    echo "::error::Agent directory ${AGENT_DIR} does not contain agent.py"
+                    exit 1
+                  fi
+                  if ! grep -q "root_agent" "${AGENT_DIR}/agent.py"; then
+                    echo "::error::agent.py does not export root_agent"
+                    exit 1
+                  fi
+
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+
+            - name: Install ADK
+              # google-adk 2.x (released Nov 2026) calls vertexai.Client(),
+              # which is only available in google-cloud-aiplatform>=1.95. Pin
+              # ADK to the 1.x line until the Agent Engine runtime is verified
+              # against 2.x. Mirror this pin in agents/*/requirements.txt so
+              # the runtime build (which Agent Engine runs server-side from
+              # requirements.txt) resolves to the same toolchain.
+              run: pip install 'google-adk>=1.2,<2' 'google-cloud-aiplatform[agent_engines,adk]>=1.95,<2'
+
+            - uses: google-github-actions/auth@v2
+              with:
+                  workload_identity_provider: "projects/194773164895/locations/global/workloadIdentityPools/github-actions/providers/github"
+                  service_account: "${{ steps.config.outputs.github_deploy_sa }}"
+
+            - uses: google-github-actions/setup-gcloud@v2
+
+            - name: Bundle broadchurch.yaml into agent directory
+              run: |
+                  AGENT_DIR="agents/${{ inputs.agent_name }}"
+                  cp broadchurch.yaml "${AGENT_DIR}/broadchurch.yaml"
+                  echo "Bundled broadchurch.yaml into ${AGENT_DIR}/"
+
+            - name: Bundle shared agent utilities
+              run: |
+                  AGENT_DIR="agents/${{ inputs.agent_name }}"
+                  if [ -f "agents/broadchurch_auth.py" ]; then
+                    cp agents/broadchurch_auth.py "${AGENT_DIR}/"
+                    echo "Bundled broadchurch_auth.py into ${AGENT_DIR}/"
+                  fi
+
+            - name: Discover MCP server URLs
+              id: mcp
+              run: |
+                  GATEWAY="${{ steps.config.outputs.gateway_url }}"
+                  ORG_ID="${{ steps.config.outputs.org_id }}"
+                  MCP_URL=""
+                  if [ -n "${GATEWAY}" ] && [ -n "${ORG_ID}" ]; then
+                    MCP_URL=$(curl -sf "${GATEWAY}/api/config/${ORG_ID}" 2>/dev/null \
+                      | jq -r '.mcp_servers[0].url // empty' 2>/dev/null || true)
+                  fi
+                  echo "mcp_server_url=${MCP_URL}" >> "$GITHUB_OUTPUT"
+                  if [ -n "${MCP_URL}" ]; then
+                    echo "Found MCP server: ${MCP_URL}"
+                  else
+                    echo "No MCP servers found (agent will deploy without MCP tools)"
+                  fi
+
+            - name: Deploy to Agent Engine
+              id: deploy
+              env:
+                  # MCP_SERVER_URL is a BUILD-TIME env var only. ADK evaluates
+                  # agent.py during deploy — if the agent uses McpToolset, this
+                  # lets ADK discover and serialize the MCP tool definitions.
+                  # It does NOT propagate to the Vertex AI runtime.
+                  MCP_SERVER_URL: ${{ steps.mcp.outputs.mcp_server_url }}
+                  # Do NOT set ELEMENTAL_API_URL here — it won't reach the
+                  # runtime either. Agents should read broadchurch.yaml (bundled
+                  # above) via broadchurch_auth instead.
+              run: |
+                  DISPLAY_NAME="${{ steps.config.outputs.project_name }}--${{ inputs.agent_name }}"
+                  echo "display_name=${DISPLAY_NAME}" >> "$GITHUB_OUTPUT"
+
+                  OUTPUT=$(adk deploy agent_engine \
+                    --project "${{ steps.config.outputs.project }}" \
+                    --region "${{ steps.config.outputs.region }}" \
+                    --display_name "${DISPLAY_NAME}" \
+                    --trace_to_cloud \
+                    "agents/${{ inputs.agent_name }}/" 2>&1) || {
+                    echo "::error::ADK deploy failed"
+                    echo "$OUTPUT"
+                    exit 1
+                  }
+
+                  echo "$OUTPUT"
+                  RESOURCE=$(echo "$OUTPUT" | grep -oP 'projects/\d+/locations/[^/]+/reasoningEngines/\d+' | tail -1)
+                  if [ -z "$RESOURCE" ]; then
+                    echo "::error::Could not extract resource ID from deploy output"
+                    exit 1
+                  fi
+                  echo "resource_id=${RESOURCE}" >> "$GITHUB_OUTPUT"
+                  echo "Deployed: ${RESOURCE}"
+
+            - name: Register with Portal
+              run: |
+                  GATEWAY="${{ steps.config.outputs.gateway_url }}"
+                  ORG_ID="${{ steps.config.outputs.org_id }}"
+                  RESOURCE="${{ steps.deploy.outputs.resource_id }}"
+                  DISPLAY_NAME="${{ steps.deploy.outputs.display_name }}"
+                  AGENT_NAME="${{ inputs.agent_name }}"
+
+                  curl -sf -X POST "${GATEWAY}/api/agents/${ORG_ID}" \
+                    -H "Content-Type: application/json" \
+                    -d "{
+                      \"resource_id\": \"${RESOURCE}\",
+                      \"display_name\": \"${DISPLAY_NAME}\",
+                      \"agent_name\": \"${AGENT_NAME}\",
+                      \"deployed_by\": \"github-actions\"
+                    }"
+
+                  echo "Registered ${AGENT_NAME} with Portal gateway"
+
+            - name: Smoke test deployed agent
+              continue-on-error: true
+              run: |
+                  GATEWAY="${{ steps.config.outputs.gateway_url }}"
+                  ORG_ID="${{ steps.config.outputs.org_id }}"
+                  RESOURCE="${{ steps.deploy.outputs.resource_id }}"
+
+                  # Extract the numeric engine ID from the full resource path
+                  ENGINE_ID=$(echo "${RESOURCE}" | grep -oP '\d+$')
+                  if [ -z "${ENGINE_ID}" ]; then
+                    echo "::warning::Could not extract engine ID for smoke test"
+                    exit 0
+                  fi
+
+                  echo "Running smoke test against ${GATEWAY}/api/agents/${ORG_ID}/${ENGINE_ID}/query"
+
+                  # Create a session — validates the agent is loaded and responsive
+                  RESP=$(curl -sf -w "\n%{http_code}" -X POST \
+                    "${GATEWAY}/api/agents/${ORG_ID}/${ENGINE_ID}/query" \
+                    -H "Content-Type: application/json" \
+                    -d '{"message": "hello", "user_id": "smoke-test"}' \
+                    2>&1) || true
+
+                  HTTP_CODE=$(echo "$RESP" | tail -1)
+                  BODY=$(echo "$RESP" | head -n -1)
+
+                  if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                    echo "Smoke test passed (HTTP ${HTTP_CODE})"
+                  else
+                    echo "::warning::Smoke test returned HTTP ${HTTP_CODE}. The agent deployed but may have runtime issues (auth, config, etc.)."
+                    echo "Response: ${BODY}"
+                  fi

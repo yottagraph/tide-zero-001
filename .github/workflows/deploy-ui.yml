@@ -1,0 +1,274 @@
+name: Deploy Aether UI
+# BC 2.0 tenant UI hosting — GKE Deployment in the per-tenant cluster
+# (ADR-020, design contract in
+# broadchurch:docs/BC_2_TENANT_UI_HOSTING_PHASE1.md). Sibling of
+# deploy-job.yml; the structural shape is intentionally the same so
+# operators have one mental model for "deploy a thing to the tenant
+# cluster."
+#
+# Provisioning vs deploy split (Phase 1):
+#
+#   - The Portal owns provisioning: creates the `tenant-ui` namespace,
+#     Workload Identity SA, RBAC bindings, the K8s Deployment spec
+#     (with a placeholder image), the Service, the ServiceAttachment,
+#     and the broadchurch-side ALB plumbing. None of that is in this
+#     workflow.
+#   - This workflow only **rolls the existing Deployment to a new image
+#     SHA**. No K8s resources are created or applied here. That keeps
+#     the deploy path tiny and the failure surface small.
+#
+# Phase 1 trigger surface:
+#
+#   - workflow_dispatch only. Push-on-main auto-deploy is a Phase 1.5
+#     enhancement once a handful of tenants have burned in on the
+#     substrate; flipping it on is a one-line change here. Until then
+#     the Portal cockpit's "Deploy Now" button (and `gh workflow run
+#     deploy-ui.yml`) is the deploy entrypoint.
+#
+# Substrate guard:
+#
+#   - Reads `hosting:` from `broadchurch.yaml`. Exits cleanly (0) for
+#     `hosting: vercel` tenants — the template ships the workflow to
+#     every tenant so a future migration to GCP is a config-only flip,
+#     but it does nothing for tenants that haven't opted in.
+on:
+    workflow_dispatch: {}
+
+permissions:
+    contents: read
+    id-token: write
+
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            # Mirrors deploy-job.yml's config step. The same broadchurch.yaml
+            # convention applies — see the comments there for why we prefer
+            # the per-tenant `github_deploy_sa` and per-tenant `wif_provider`
+            # over central defaults.
+            - name: Read config from broadchurch.yaml
+              id: config
+              run: |
+                  HOSTING=$(yq -r '.hosting // "vercel"' broadchurch.yaml)
+                  echo "hosting=${HOSTING}" >> "$GITHUB_OUTPUT"
+                  echo "project=$(yq -r '.gcp.project' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "region=$(yq -r '.gcp.region' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "project_name=$(yq -r '.tenant.project_name' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "org_id=$(yq -r '.tenant.org_id' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "gateway_url=$(yq -r '.gateway.url' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+
+                  # Per-tenant github-deploy SA; falls back to <project>-default
+                  # for tenants whose YAML hasn't been re-rendered yet.
+                  GH_DEPLOY_SA=$(yq -r '.gcp.github_deploy_sa // ""' broadchurch.yaml)
+                  if [ -z "${GH_DEPLOY_SA}" ] || [ "${GH_DEPLOY_SA}" = "null" ]; then
+                    GH_DEPLOY_SA="github-deploy@$(yq -r '.gcp.project' broadchurch.yaml).iam.gserviceaccount.com"
+                  fi
+                  echo "github_deploy_sa=${GH_DEPLOY_SA}" >> "$GITHUB_OUTPUT"
+
+                  # BC 2.0: WIF pool lives in the BC Portal project, not the
+                  # legacy broadchurch project. broadchurch.yaml carries
+                  # `gcp.wif_provider` (full resource name) on BC 2.0 tenants.
+                  WIF_PROVIDER=$(yq -r '.gcp.wif_provider // ""' broadchurch.yaml)
+                  if [ -z "${WIF_PROVIDER}" ] || [ "${WIF_PROVIDER}" = "null" ]; then
+                    WIF_PROVIDER="projects/194773164895/locations/global/workloadIdentityPools/github-actions/providers/github"
+                  fi
+                  echo "wif_provider=${WIF_PROVIDER}" >> "$GITHUB_OUTPUT"
+
+            # Hard substrate guard. Vercel tenants ship the workflow (so a
+            # future migration to GCP is config-only) but it does nothing
+            # for them. Exit 0 — not a failure, just a no-op.
+            - name: Guard — UI substrate must be `gcp`
+              if: steps.config.outputs.hosting != 'gcp'
+              run: |
+                  echo "::notice::hosting=${{ steps.config.outputs.hosting }} — Aether UI is not on the GCP substrate for this tenant; skipping."
+                  echo "::notice::See broadchurch:docs/BC_2_TENANT_UI_HOSTING_PHASE1.md for the substrate migration path."
+                  exit 0
+
+            - name: Validate Dockerfile
+              if: steps.config.outputs.hosting == 'gcp'
+              run: |
+                  if [ ! -f Dockerfile ]; then
+                    echo "::error::Repo root Dockerfile is required for the GCP substrate. See aether-dev#129 for the canonical multi-stage Dockerfile."
+                    exit 1
+                  fi
+
+            - uses: google-github-actions/auth@v2
+              if: steps.config.outputs.hosting == 'gcp'
+              with:
+                  workload_identity_provider: ${{ steps.config.outputs.wif_provider }}
+                  service_account: ${{ steps.config.outputs.github_deploy_sa }}
+
+            - uses: google-github-actions/setup-gcloud@v2
+              if: steps.config.outputs.hosting == 'gcp'
+
+            # Cloud Build in the per-tenant project — same shape as the K8s
+            # Jobs path, just with the repo root as the build context. The
+            # AR `aether` repo is provisioned by gcp-bctenant (ENG-667 sub-
+            # issue #2). Image tag is the 7-char commit SHA; immutable +
+            # deterministic + maps to `kubectl rollout undo` semantics.
+            - name: Build and push UI image
+              if: steps.config.outputs.hosting == 'gcp'
+              id: build
+              env:
+                  PROJECT: ${{ steps.config.outputs.project }}
+                  REGION: ${{ steps.config.outputs.region }}
+              run: |
+                  set -euo pipefail
+                  SHA="${GITHUB_SHA:0:7}"
+                  IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/aether/aether-app:${SHA}"
+                  echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+                  echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+                  BUILD_ID=$(gcloud builds submit \
+                    --project "${PROJECT}" \
+                    --tag "${IMAGE}" \
+                    --timeout=20m \
+                    --async --format='value(id)' \
+                    --quiet)
+                  echo "Submitted Cloud Build: ${BUILD_ID}"
+
+                  while true; do
+                    STATUS=$(gcloud builds describe "${BUILD_ID}" \
+                      --project "${PROJECT}" \
+                      --format='value(status)')
+                    echo "Build status: ${STATUS}"
+                    if [[ "${STATUS}" == "SUCCESS" ]]; then break; fi
+                    if [[ "${STATUS}" =~ ^(FAILURE|CANCELLED|TIMEOUT|INTERNAL_ERROR)$ ]]; then
+                      echo "::error::Cloud Build failed with status: ${STATUS}"
+                      echo "::error::Log: https://console.cloud.google.com/cloud-build/builds/${BUILD_ID}?project=${PROJECT}"
+                      exit 1
+                    fi
+                    sleep 15
+                  done
+                  echo "::notice::Pushed ${IMAGE}"
+
+            # Resolves project_number + location + membership_id from the
+            # Portal — same endpoint as deploy-job.yml. The Portal currently
+            # returns namespace=tenant-jobs (the K8s Jobs default); we
+            # override that here because UI lives in `tenant-ui`. ENG-667
+            # follow-up can generalise the Portal endpoint with a
+            # ?substrate query param if a third namespace ever lands.
+            - name: Resolve cluster coordinates from Portal
+              if: steps.config.outputs.hosting == 'gcp'
+              id: coords
+              env:
+                  GATEWAY: ${{ steps.config.outputs.gateway_url }}
+                  ORG_ID: ${{ steps.config.outputs.org_id }}
+              run: |
+                  set -euo pipefail
+                  COORDS=$(curl -sSf "${GATEWAY}/api/projects/${ORG_ID}/connect-gateway") || {
+                    echo "::error::Portal connect-gateway lookup failed for org_id=${ORG_ID}. If this tenant predates the BC 2.0 GCP capability, provision it via Portal before deploying with hosting: gcp."
+                    exit 1
+                  }
+                  PROJECT_NUMBER=$(jq -r .project_number <<<"${COORDS}")
+                  LOCATION=$(jq -r .location <<<"${COORDS}")
+                  MEMBERSHIP_ID=$(jq -r .gke_hub_membership_id <<<"${COORDS}")
+                  for v in PROJECT_NUMBER LOCATION MEMBERSHIP_ID; do
+                    if [ -z "${!v}" ] || [ "${!v}" = "null" ]; then
+                      echo "::error::Portal returned empty ${v}. Coords: ${COORDS}"
+                      exit 1
+                    fi
+                  done
+                  echo "project_number=${PROJECT_NUMBER}" >> "$GITHUB_OUTPUT"
+                  echo "location=${LOCATION}" >> "$GITHUB_OUTPUT"
+                  echo "membership_id=${MEMBERSHIP_ID}" >> "$GITHUB_OUTPUT"
+                  echo "namespace=tenant-ui" >> "$GITHUB_OUTPUT"
+                  echo "Resolved: project=${PROJECT_NUMBER} loc=${LOCATION} membership=${MEMBERSHIP_ID} ns=tenant-ui"
+
+            # Mirror of the deploy-job.yml Connect Gateway step. Same
+            # KUBECONFIG file shape; the only difference is the namespace
+            # we land in.
+            - name: Configure kubectl for Connect Gateway
+              if: steps.config.outputs.hosting == 'gcp'
+              env:
+                  PROJECT_NUMBER: ${{ steps.coords.outputs.project_number }}
+                  LOCATION: ${{ steps.coords.outputs.location }}
+                  MEMBERSHIP_ID: ${{ steps.coords.outputs.membership_id }}
+                  NAMESPACE: ${{ steps.coords.outputs.namespace }}
+              run: |
+                  set -euo pipefail
+                  TOKEN=$(gcloud auth print-access-token)
+                  APISERVER="https://connectgateway.googleapis.com/v1/projects/${PROJECT_NUMBER}/locations/${LOCATION}/gkeMemberships/${MEMBERSHIP_ID}"
+                  KUBECONFIG_FILE=/tmp/kubeconfig
+                  cat > "${KUBECONFIG_FILE}" <<EOF
+                  apiVersion: v1
+                  kind: Config
+                  clusters:
+                  - name: tenant
+                    cluster:
+                      server: ${APISERVER}
+                  contexts:
+                  - name: tenant
+                    context:
+                      cluster: tenant
+                      user: gateway
+                      namespace: ${NAMESPACE}
+                  current-context: tenant
+                  users:
+                  - name: gateway
+                    user:
+                      token: ${TOKEN}
+                  EOF
+                  echo "KUBECONFIG=${KUBECONFIG_FILE}" >> "$GITHUB_ENV"
+                  echo "Configured kubectl for ${APISERVER}"
+                  kubectl version --client --output=yaml | head -n 5
+                  if ! kubectl get deployment aether-ui -n "${NAMESPACE}" -o name >/dev/null 2>&1; then
+                    echo "::error::Deployment ${NAMESPACE}/aether-ui does not exist. The Portal owns provisioning of this Deployment (BC_2_TENANT_UI_HOSTING_PHASE1.md § Provisioning step 2). Run \`bc-portal provision-ui-substrate ${{ steps.config.outputs.org_id }}\` (or use the BC 2.0 cockpit's 'Enable GCP substrate' button) before the first deploy."
+                    exit 1
+                  fi
+
+            # Roll the Deployment. `kubectl set image` is idempotent (no-op
+            # if the SHA hasn't changed) and triggers a rolling restart
+            # otherwise. Cap the rollout wait at 3 min — Aether's readiness
+            # probe is short (5s) so well-provisioned tenants land in 30-90s.
+            - name: Roll Deployment to the new image
+              if: steps.config.outputs.hosting == 'gcp'
+              env:
+                  NAMESPACE: ${{ steps.coords.outputs.namespace }}
+                  IMAGE: ${{ steps.build.outputs.image }}
+              run: |
+                  set -euo pipefail
+                  echo "Rolling deployment/aether-ui to ${IMAGE}"
+                  kubectl set image \
+                    deployment/aether-ui \
+                    aether-ui="${IMAGE}" \
+                    -n "${NAMESPACE}" \
+                    --record=false
+
+                  kubectl rollout status \
+                    deployment/aether-ui \
+                    -n "${NAMESPACE}" \
+                    --timeout=180s
+
+                  # Quick sanity log so the CI run captures what landed.
+                  kubectl get deployment aether-ui -n "${NAMESPACE}" \
+                    -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'
+
+            # Portal-side deploy-history record. Mirrors the K8s Jobs
+            # `Register with Portal` step. The endpoint
+            # `POST /api/projects/<org>/ui-deploys` lands in Phase 1
+            # sub-issue #5 (Portal /deploy + read paths); until then this
+            # call returns 404 and we emit a warning rather than failing
+            # the deploy. The image has rolled regardless.
+            - name: Register deploy with Portal
+              if: steps.config.outputs.hosting == 'gcp'
+              env:
+                  GATEWAY: ${{ steps.config.outputs.gateway_url }}
+                  ORG_ID: ${{ steps.config.outputs.org_id }}
+                  IMAGE: ${{ steps.build.outputs.image }}
+                  SHA: ${{ steps.build.outputs.sha }}
+              run: |
+                  curl -sf -X POST "${GATEWAY}/api/projects/${ORG_ID}/ui-deploys" \
+                    -H 'Content-Type: application/json' \
+                    -d "{
+                      \"image\": \"${IMAGE}\",
+                      \"sha\": \"${SHA}\",
+                      \"commit_sha\": \"${GITHUB_SHA}\",
+                      \"workflow_run_id\": \"${GITHUB_RUN_ID}\",
+                      \"deployed_by\": \"github-actions\"
+                    }" \
+                    || echo "::warning::Portal /ui-deploys registration failed or 404 (likely ENG-667 #5 hasn't shipped yet). Deploy succeeded; cockpit history may lag."
+
+                  echo "::notice::Aether UI rolled to ${IMAGE} for org_id=${ORG_ID}"

@@ -1,0 +1,15 @@
+{
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "install": "export NVM_DIR=\"${NVM_DIR:-$HOME/.nvm}\" && [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\" && nvm install 20 && nvm alias default 20; (test -f .env || node init-project.js --local) && npm install",
+    "terminals": [
+        {
+            "name": "Dev Server",
+            "command": "npm run dev",
+            "port": 3000
+        }
+    ],
+    "persistedDirectories": ["node_modules", ".nuxt", ".output"]
+}
